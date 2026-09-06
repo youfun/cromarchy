@@ -1,0 +1,232 @@
+# Build submarine-x86_64.zip from FyraLabs/submarine source so the boot
+# payload is traceable: upstream commit → this workflow → sha256 pin in
+# the installer. The zip will NOT match FyraLabs nightly byte-for-byte
+# (kernel timestamps, compiler). That is expected.
+
+name: Build submarine
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: FyraLabs/submarine ref or SHA (empty = main, resolved at runtime)
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: build-submarine
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: FyraLabs/submarine
+  ZIP_NAME: submarine-x86_64.zip
+  RELEASE_TAG: submarine/v1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Resolve upstream commit
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED}" ]]; then
+            SHA="$(gh api "repos/${UPSTREAM_REPO}/commits/${REQUESTED}" --jq .sha)"
+          else
+            SHA="$(gh api "repos/${UPSTREAM_REPO}/commits/main" --jq .sha)"
+          fi
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+          echo "short=${SHA:0:12}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved ${UPSTREAM_REPO}@${SHA}"
+
+      # actions/checkout@v4.4.0
+      - name: Checkout FyraLabs/submarine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: FyraLabs/submarine
+          ref: ${{ steps.src.outputs.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Record source commits
+        id: pins
+        run: |
+          set -euo pipefail
+          UROOT="$(git rev-parse HEAD:u-root)"
+          KERNEL="$(git rev-parse HEAD:kernel)"
+          echo "uroot=${UROOT}" >> "${GITHUB_OUTPUT}"
+          echo "kernel=${KERNEL}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "upstream_repo=https://github.com/${UPSTREAM_REPO}"
+            echo "upstream_commit=${{ steps.src.outputs.sha }}"
+            echo "u-root_commit=${UROOT}"
+            echo "kernel_commit=${KERNEL}"
+            echo "workflow=${{ github.workflow }}"
+            echo "run_id=${{ github.run_id }}"
+            echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "image_os=${ImageOS:-unknown}"
+          } | tee BUILDINFO.txt
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # Ubuntu has no vboot-key package. Chromium OS devkeys live in
+          # vboot-kernel-utils at /usr/share/vboot/devkeys (what Fedora
+          # Terra's vboot-key provides). cgpt is a separate binary package.
+          # golang-go from apt is kept as requested but is too old for
+          # current u-root (go 1.24); setup-go below supplies the toolchain.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            gcc make flex bison bc \
+            libssl-dev libelf-dev \
+            golang-go \
+            xz-utils parted \
+            vboot-utils vboot-kernel-utils cgpt \
+            git patch file zip cpio python3 \
+            ca-certificates
+          test -f /usr/share/vboot/devkeys/kernel_data_key.vbprivk
+          test -f /usr/share/vboot/devkeys/kernel.keyblock
+          command -v futility
+          command -v cgpt
+          gcc --version | head -1
+          futility --help >/dev/null
+
+      # actions/setup-go@v5.5.0 — apt golang-go on ubuntu-latest is < 1.24
+      - name: Setup Go from u-root go.mod
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version-file: u-root/go.mod
+          cache-dependency-path: u-root/go.sum
+
+      - name: Install u-root from the locked submodule
+        run: |
+          set -euo pipefail
+          ( cd u-root && go install )
+          echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
+          "$(go env GOPATH)/bin/u-root" --help >/dev/null
+
+      - name: Build x86_64 (upstream Makefile)
+        run: make -j"$(nproc)" x86_64
+
+      - name: Self-check artifacts
+        run: |
+          set -euo pipefail
+          cd build
+          test -f bzImage.x86
+          test -f submarine-x86.bin
+          test -f submarine-x86.kpart
+          test -f u-root-x86.cpio
+          test -f u-root-x86.cpio.xz
+
+          bin_desc="$(file -b submarine-x86.bin)"
+          k_desc="$(file -b bzImage.x86)"
+          echo "submarine-x86.bin: ${bin_desc}"
+          echo "bzImage.x86: ${k_desc}"
+          echo "${bin_desc}" | grep -Eq 'DOS/MBR boot sector'
+          echo "${k_desc}" | grep -Eqi 'Linux kernel.*bzImage'
+
+          grep -a -q CHROMEOS submarine-x86.kpart
+
+          extract="$(mktemp -d)"
+          cpio_path="$(pwd)/u-root-x86.cpio"
+          ( cd "${extract}" && cpio -id --quiet < "${cpio_path}" )
+          flags="${extract}/etc/uinit.flags"
+          test -f "${flags}"
+          echo "uinit.flags (repr): $(cat -A "${flags}")"
+          normalized="$(tr '\n' ' ' < "${flags}" | sed 's/[[:space:]]*$//')"
+          expected='"-c" "sleep 3; boot"'
+          if [[ "${normalized}" != "${expected}" ]]; then
+            echo "unexpected uinit.flags: ${normalized}" >&2
+            echo "expected: ${expected}" >&2
+            exit 1
+          fi
+
+      - name: Pack zip and hash
+        id: hash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Root of zip = the five files (same layout as the repo zip).
+          ( cd build && zip -X -9 "../dist/${ZIP_NAME}" \
+              bzImage.x86 \
+              submarine-x86.bin \
+              submarine-x86.kpart \
+              u-root-x86.cpio \
+              u-root-x86.cpio.xz )
+          ZIP_SHA="$(sha256sum "dist/${ZIP_NAME}" | awk '{print $1}')"
+          BIN_SHA="$(sha256sum build/submarine-x86.bin | awk '{print $1}')"
+          echo "zip_sha256=${ZIP_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "bin_sha256=${BIN_SHA}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "zip_sha256=${ZIP_SHA}"
+            echo "submarine-x86.bin_sha256=${BIN_SHA}"
+            echo "gcc=$(gcc --version | head -1)"
+            echo "go=$(go version)"
+          } | tee -a BUILDINFO.txt
+          cp BUILDINFO.txt dist/BUILDINFO.txt
+          {
+            echo "## Submarine CI build"
+            echo
+            echo "- upstream: \`${UPSTREAM_REPO}@${{ steps.src.outputs.sha }}\`"
+            echo "- u-root: \`${{ steps.pins.outputs.uroot }}\`"
+            echo "- kernel: \`${{ steps.pins.outputs.kernel }}\`"
+            echo "- \`${ZIP_NAME}\` sha256: \`${ZIP_SHA}\`"
+            echo "- \`submarine-x86.bin\` sha256: \`${BIN_SHA}\`"
+            echo "- runner: \`${RUNNER_OS}\` \`${ImageOS:-unknown}\`"
+            echo
+            echo "Not byte-identical to FyraLabs nightly. Traceability is commit → CI → hash."
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      # actions/upload-artifact@v4.6.2
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: submarine-x86_64
+          path: |
+            dist/${{ env.ZIP_NAME }}
+            dist/BUILDINFO.txt
+          if-no-files-found: error
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          cat > dist/RELEASE.md <<EOF
+          Submarine x86_64 built by cromarchy CI from FyraLabs/submarine source.
+
+          | Field | Value |
+          | --- | --- |
+          | Upstream | https://github.com/${UPSTREAM_REPO} |
+          | Upstream commit | \`${{ steps.src.outputs.sha }}\` |
+          | u-root submodule | \`${{ steps.pins.outputs.uroot }}\` |
+          | kernel submodule | \`${{ steps.pins.outputs.kernel }}\` |
+          | \`${ZIP_NAME}\` sha256 | \`${{ steps.hash.outputs.zip_sha256 }}\` |
+          | \`submarine-x86.bin\` sha256 | \`${{ steps.hash.outputs.bin_sha256 }}\` |
+          | Runner | \`${RUNNER_OS}\` / \`${ImageOS:-unknown}\` |
+          | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+          This zip is **not** expected to match the FyraLabs nightly binary byte-for-byte (kernel build timestamps, compiler version). Safety comes from the traceable chain: source commit → this workflow → installer sha256 pin.
+          EOF
+
+      # softprops/action-gh-release@v2.5.3
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@1853d73993c8ca1b2c9c1a7fede39682d0ab5c2a
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Submarine x86_64 (${{ steps.src.outputs.short }})
+          body_path: dist/RELEASE.md
+          files: |
+            dist/${{ env.ZIP_NAME }}
+            dist/BUILDINFO.txt
+          make_latest: false
+          fail_on_unmatched_files: true
+          target_commitish: ${{ github.sha }}
