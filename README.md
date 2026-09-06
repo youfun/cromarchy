@@ -60,7 +60,7 @@ See [chromebook-linux-audio](https://github.com/WeirdTreeThing/chromebook-linux-
 
 ## What the script does
 
-It downloads `submarine-x86_64.zip` from this repo (built by this repo's CI from a pinned [FyraLabs/submarine](https://github.com/FyraLabs/submarine) commit), unzips it, and `dd`s `submarine.bin` onto the internal disk. The zip sha256 is pinned in the installer script; the upstream commit SHA is recorded on the GitHub Release page.
+It downloads `submarine-x86_64.zip` from this repo (built by this repo's CI from a pinned [FyraLabs/submarine](https://github.com/FyraLabs/submarine) commit), unzips it, and `dd`s `submarine-x86.bin` onto the internal disk. The zip sha256 is pinned in the installer script, and its source commits and hashes are recorded in `submarine-x86_64.buildinfo`. Releases publish these exact reviewed repository files rather than rebuilding them.
 
 Submarine is a tiny Linux kernel that depthcharge can load. It finds `grub.cfg` and `kexec`s the real distro kernel.
 

@@ -62,7 +62,7 @@ curl -fsSL https://omarchy.org/install | bash
 
 ## 脚本在做什么
 
-从本仓库下载 `submarine-x86_64.zip`（由本仓库 CI 从 [FyraLabs/submarine](https://github.com/FyraLabs/submarine) 指定 commit 构建），解压后把 `submarine.bin` `dd` 到内置盘。zip 的 sha256 钉在安装脚本里；上游 commit SHA 记在 GitHub Release 页。
+从本仓库下载 `submarine-x86_64.zip`（由本仓库 CI 从 [FyraLabs/submarine](https://github.com/FyraLabs/submarine) 指定 commit 构建），解压后把 `submarine-x86.bin` `dd` 到内置盘。zip 的 sha256 钉在安装脚本里，源码 commit 与产物哈希记录在 `submarine-x86_64.buildinfo`。Release 发布的是仓库中经过审核的同一组文件，不会重新构建出另一份产物。
 
 Submarine 是 depthcharge 能加载的微型 Linux 内核。它会查找 `grub.cfg`，再用 `kexec` 启动真正的发行版内核。
 

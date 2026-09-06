@@ -1,0 +1,13 @@
+upstream_repo=https://github.com/FyraLabs/submarine
+upstream_commit=63ee8df1d55e384fee02f6bfedabca791f44f082
+u-root_commit=b6c6143928b63f3e0c6d675d0b86c7338fb17cb1
+kernel_commit=f1e375d5eb68f990709fce37ee1c0ecae3645b6f
+workflow=Build submarine
+run_id=34016168554
+run_url=https://github.com/youfun/cromarchy/actions/runs/34016168554
+runner_os=Linux
+image_os=ubuntu24
+zip_sha256=5699450668af47e3bca80b34c3ae5a9fc438a248d357e353c3821bef0c3d1ca5
+submarine-x86.bin_sha256=96d5ce7b49e89d367f60608ffc6c03558a08850aaa2f43f5b28d271a596123e9
+gcc=gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+go=go version go1.24.0 linux/amd64
