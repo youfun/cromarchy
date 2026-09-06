@@ -1,47 +1,79 @@
-## Introduction
-One script, in-place Ubuntu installer (replace ChromeOS) for Chromebook. 
+# cromarchy
 
-**Only x86 devices are supported at this moment.**
+[中文说明](README.zh-CN.md)
 
-No USB drive, no RW_LEGACY, no WP unlocking needed! (It uses [Submarine](https://github.com/FyraLabs/submarine) as the bootloader)
+One script, in-place **Ubuntu** or **Omarchy** installer that replaces ChromeOS on a Chromebook.
 
-All you need is:
-1. [Turn on Developer mode on your Chromebook.](https://www.chromium.org/chromium-os/developer-library/guides/device/developer-mode/) (Short answer: Press [ESC + Refresh + Power button], after the recovery screen appeared, press [Ctrl + D])
-2. Once ChromeOS started in developer mode, just connect to Wi-Fi. **No need** to login with Google Account!
-3. Press [Ctrl+Alt+F2`(Refresh/Forward)`] enter VT2 console, login with `root` (should be no password).
-4. Enter following commands:
-    ````bash
-    cd /tmp
-    curl -LOf github.com/liyafe1997/crobuntu/raw/main/crobuntu
-    bash crobuntu
-    ````
-5. Follow the script prompt to continue (Basically select Ubuntu version and desktop environment)
-6. Wait it to be finished. After reboot, you will have Ubuntu!
-7. If you want to go back to ChromeOS, press [ESC+Refresh+Power] to recover. Read [Recover your Chromebook](https://support.google.com/chromebook/answer/1080595) to learn more.
+Based on [liyafe1997/crobuntu](https://github.com/liyafe1997/crobuntu). Omarchy support is unofficial.
 
-Note:
-1. Default username: `ubuntu`, password: `ubuntu`.
-2. Web browser might not be installed because snap pacakegs could not be installed automatically during the `chroot` setup process. You can just simply do `snap install firefox` to get Firefox installed.
-3. This script will preseve the ChromeOS Cloud Recovery partition for you (aka MINIOS-B, a small parition at the end of the disk). If your device supports cloud recovery, you should be able to go back to ChromeOS just by press [ESC+Refresh+Power] and select [Recover using internet], without making a USB drive. If you think you don't need that you can also delete it and expand the ext4 rootfs in Ubuntu. Once you delete that partition, you have to use a USB drive to recover ChromeOS.
+**Only x86_64 devices are supported.**
 
-## No Sound on Ubuntu?
-Check https://github.com/WeirdTreeThing/chromebook-linux-audio
+No USB drive, no RW_LEGACY, no write-protect unlocking. Boot uses [Submarine](https://github.com/FyraLabs/submarine).
 
-## What the script does (Techical details)
-It downloads `submarine-x86_64.zip` from this repository (I got it from https://nightly.link/FyraLabs/submarine/workflows/build/main/submarine-x86_64.zip, which is the offical release place of submarine), unzip it, and use `dd` to write `submarine.bin` to internal disk.
+## Install
 
-Basically `submarine` is a mini Linux kernel which can be loaded by Chromebook's bootloader `depthcharge`, it searches for something like `grub.cfg` on all partitions and parse it, then use `kexec` to execute/boot that real distro kernel.
+1. [Turn on Developer mode](https://www.chromium.org/chromium-os/developer-library/guides/device/developer-mode/) (Esc + Refresh + Power, then Ctrl + D).
+2. Connect to Wi-Fi. You do **not** need to sign in with a Google account.
+3. Press Ctrl+Alt+F2 (Refresh/Forward) for VT2. Login as `root` (usually no password).
+4. Run:
 
-So we need a `EFI` partition to make Ubuntu's `grub-install` happy, we don't really need EFI things but `grub-install` and `update-grub` can install grub to that (trick it we have a EFI-like installation). That's also for possible kernel upgrading compatible in the future, `apt/dpkg` will trigger `update-grub` to generate new kernel entrance in that `EFI` partition. So we should not somehow hardcode the kernel/entrance just make `submarine` works at this moment.
+```bash
+cd /tmp
+curl -LOf https://github.com/youfun/cromarchy/raw/main/cromarchy
+bash cromarchy
+```
 
-And then we need the third parition which is the ext4 rootfs for Ubuntu.
+5. Choose **Ubuntu** or **Omarchy**. For Ubuntu, pick a version and desktop.
+6. Wait until it finishes, then press Refresh + Power to reboot.
+7. To get ChromeOS back: Esc + Refresh + Power and recover. See [Recover your Chromebook](https://support.google.com/chromebook/answer/1080595).
 
-Then it will setup a ~10GB staging loop device at the end of the disk. The purpose is, if we just use the third ext4, it is on the beginning of the disk and it will overwrite the current ChromeOS's rootfs. Even in the script I've adready stop `system-services` (which stops most of the ChromeOS's userspace stuffs, to prevent them still read the fs randomly), it still risky to cause random reboot if some processes still read the fs but the fs is corrupted (overwrited by our ext4 fs). Overwrite the end of the disk could be much safer because generally there should be not much data on that with a fresh ChromeOS, at least, while I am testing, it never cause random reboots.
+Do **not** run this from crosh, Crostini, or Baguette.
 
-Then it will format the staging loop as ext4, download the Ubuntu's base system tar ball and unpack to the temporary staging loop, chroot, install packages, install grub to the EFI partiton, etc.
+## Defaults
 
-Once it finishes, exit chroot and `dd` the staging loop ext4 to the real partiton. Since the `dd` process is not so long and no any other activity, during this process, also should be safe and would not cause any reboots.
+| Target | User | Password |
+| --- | --- | --- |
+| Ubuntu | `ubuntu` | `ubuntu` |
+| Omarchy | `omarchy` | `omarchy` |
 
-So for this ~10GB staging setup, you need at least 2x10GB ≈ 20GB+ internal disk size to make it works(able to `dd` back to the real parition without overlap). Which means, this script should work with 32GB and above Chromebooks, 16GB models would not work. If you have a small storage (16GB or less), you still can manually adjust `STAGING_SIZE_MIB` and `MIN_NON_OVERLAP_DISK_MIB` in the script to make it works. But be aware of, install desktop environment may need a lot of space, for small staging size may not enough for some large desktop setup (like `kubuntu-desktop`, it needs maybe 8GB+).
+Ubuntu may not include a browser (snap cannot run in the ChromeOS chroot). After boot: `snap install firefox`.
 
-Once the `dd` is done, your ChromeOS's partitions and fs might be corrupted and destroyed and replaced with the Ubuntu's new fs. So just press `Refresh + Power Button` to perform a force reboot, then it will boot into `submarine` and your Ubuntu installation!
+## Omarchy notes
+
+This is **not** the official Omarchy ISO. Chromebook firmware (depthcharge) cannot boot Limine. cromarchy installs Arch + GRUB via Submarine.
+
+After first login (as `omarchy`, with network up):
+
+```bash
+curl -fsSL https://omarchy.org/install | bash
+```
+
+When the installer says you need **Limine** or **btrfs**, choose **Proceed anyway**. Snapper/Limine features will not work. Hyprland and the rest of Omarchy can still install.
+
+## Recovery partition
+
+The script tries to keep MINIOS-B (ChromeOS cloud recovery). If your device supports it, Esc + Refresh + Power → Recover using internet can restore ChromeOS without a USB stick. If you delete that partition, you need USB recovery.
+
+## No sound?
+
+See [chromebook-linux-audio](https://github.com/WeirdTreeThing/chromebook-linux-audio).
+
+## What the script does
+
+It downloads `submarine-x86_64.zip` from this repo (originally from [FyraLabs/submarine](https://nightly.link/FyraLabs/submarine/workflows/build/main/submarine-x86_64.zip)), unzips it, and `dd`s `submarine.bin` onto the internal disk.
+
+Submarine is a tiny Linux kernel that depthcharge can load. It finds `grub.cfg` and `kexec`s the real distro kernel.
+
+A fake EFI partition exists so `grub-install` / `update-grub` (or Arch `grub-mkconfig`) can run. Kernel upgrades keep working through GRUB.
+
+Rootfs is ext4 on partition 3. The installer builds a ~10GiB staging loop at the **end** of the disk, unpacks Ubuntu-base or Arch bootstrap there, chroots, then `dd`s the image onto the real rootfs. That avoids overwriting the live ChromeOS rootfs for most of the process.
+
+You need about **21GiB+** internal disk (2×10GiB staging + EFI/MINIOS). 32GB machines usually work; 16GB models do not unless you shrink `STAGING_SIZE_MIB`. Large desktops (Kubuntu, full Omarchy packages after first boot) need extra free space.
+
+After the final `dd`, ChromeOS is gone. Force reboot (Refresh + Power) into Submarine, then Ubuntu or Arch.
+
+## Credits
+
+- Original Ubuntu installer: [liyafe1997/crobuntu](https://github.com/liyafe1997/crobuntu)
+- Bootloader: [FyraLabs/submarine](https://github.com/FyraLabs/submarine)
+- Omarchy: [basecamp/omarchy](https://github.com/basecamp/omarchy) / [omarchy.org](https://omarchy.org)

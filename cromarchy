@@ -1,0 +1,802 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# In-place replace ChromeOS with Ubuntu or Omarchy (Arch + DHH).
+# Must be run on ChromeOS VT2 (Ctrl+Alt+Refresh/Forward), not from crosh.
+#
+# Omarchy cannot use its official ISO/Limine/btrfs path on stock Chromebook
+# firmware. This script still boots via Submarine + GRUB + ext4, then you run
+# the official Omarchy installer on first boot (Proceed anyway on Limine/btrfs).
+
+SUBMARINE_ZIP_URL="https://github.com/youfun/cromarchy/raw/main/submarine-x86_64.zip"
+ARCH_BOOTSTRAP_URL="https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
+WORKDIR="/tmp/submarine-install.$$"
+ROOTFS_MNT="/tmp/rootfs"
+STAGING_SIZE_MIB=10000
+DISTRO="ubuntu"
+INSTALL_USER="ubuntu"
+INSTALL_PASSWORD="ubuntu"
+
+EFI_SIZE_MIB=500
+MIN_EXTRA_MIB=1024
+ALIGN_SECTORS=2048
+
+LOOP_P2=""
+LOOP_P3=""
+LOOP_STAGE=""
+ROOTFS_UUID=""
+EFI_UUID=""
+STAGING_SIZE_BYTES=""
+STAGING_OFFSET_BYTES=""
+
+MINIOS_START=""
+MINIOS_SIZE=""
+MINIOS_TYPE_UUID=""
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+align_up() {
+    local value="$1"
+    local align="$2"
+    echo $(( ((value + align - 1) / align) * align ))
+}
+
+align_down() {
+    local value="$1"
+    local align="$2"
+    echo $(( (value / align) * align ))
+}
+
+find_target_disk() {
+    local kernel_part
+    local disk
+
+    kernel_part="$(
+        fdisk -l 2>/dev/null |
+        awk '/kernel/ { print $1; exit }'
+    )"
+
+    [[ -n "$kernel_part" ]] || die "could not find kernel partition from fdisk -l"
+
+    disk="$(sed -E 's/p?[0-9]+$//' <<<"$kernel_part")"
+    [[ -b "$disk" ]] || die "resolved target disk is not a block device: $disk"
+
+    echo "$disk"
+}
+
+detect_minios_partition() {
+    local line
+
+    line="$(fdisk -x "$DISK" 2>/dev/null | grep 'MINIOS-B' || true)"
+    if [[ -z "$line" ]]; then
+        echo
+        echo "WARNING: MINIOS-B partition not found."
+        echo "This means ChromeOS Cloud Recovery may not be available for your machine."
+        echo "If you continue, the entire disk will be replaced by Ubuntu and you will"
+        echo "need a USB drive to recover ChromeOS."
+        echo
+        read -r -p "Continue? [y/N] " ans
+        case "$ans" in
+            [Yy]|[Yy][Ee][Ss]) ;;
+            *) die "Aborted by user." ;;
+        esac
+        return 0
+    fi
+
+    MINIOS_START="$(awk '{print $2}' <<<"$line")"
+    local minios_end
+    minios_end="$(awk '{print $3}' <<<"$line")"
+    MINIOS_SIZE=$(( minios_end - MINIOS_START + 1 ))
+    MINIOS_TYPE_UUID="$(awk '{print $6}' <<<"$line")"
+
+    [[ -n "$MINIOS_START" && "$MINIOS_START" =~ ^[0-9]+$ ]] || die "could not parse MINIOS-B start sector"
+    [[ -n "$minios_end" && "$minios_end" =~ ^[0-9]+$ ]] || die "could not parse MINIOS-B end sector"
+    [[ -n "$MINIOS_TYPE_UUID" ]] || die "could not parse MINIOS-B type UUID"
+    echo 
+    echo "Found MINIOS-B (ChromeOS Cloud Recovery) partition. Nice!"
+    echo "We will keep this recovery partition for you."
+    echo "So that you can go back to ChromeOS by using ChromeOS Cloud Recovery, without making a USB drive."
+    echo "Tips: Press [ESC+Refresh+Power] and select [Recover using internet] to recover ChromeOS."
+    echo
+}
+
+select_distro() {
+    local choice
+    echo "Select system to install:"
+    PS3="Enter choice [1-2]: "
+    select choice in "Ubuntu" "Omarchy (Arch + DHH, unofficial Chromebook path)"
+    do
+        case "$choice" in
+            Ubuntu*)
+                DISTRO="ubuntu"
+                INSTALL_USER="ubuntu"
+                INSTALL_PASSWORD="ubuntu"
+                return 0
+                ;;
+            Omarchy*)
+                DISTRO="omarchy"
+                INSTALL_USER="omarchy"
+                INSTALL_PASSWORD="omarchy"
+                TAR_URL="$ARCH_BOOTSTRAP_URL"
+                DESKTOP_PACKAGE=""
+                return 0
+                ;;
+        esac
+        echo "Invalid choice, please try again."
+    done
+}
+
+select_tar_url() {
+    local choice
+    local -a tar_urls=(
+        "https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/ubuntu-base-26.04-base-amd64.tar.gz"
+        "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.4/release/ubuntu-base-24.04.3-base-amd64.tar.gz"
+    )
+
+    echo "Select rootfs tarball (Ubuntu version):"
+    PS3="Enter choice [1-$(( ${#tar_urls[@]} + 1 ))]: "
+    select choice in "${tar_urls[@]}" "Custom"
+    do
+        case "$choice" in
+            "Custom")
+                read -r -p "Enter custom TAR URL: " TAR_URL
+                [[ -n "$TAR_URL" ]] || die "custom TAR URL cannot be empty"
+                return 0
+                ;;
+            "")
+                ;;
+            *)
+                TAR_URL="$choice"
+                return 0
+                ;;
+        esac
+        echo "Invalid choice, please try again."
+    done
+}
+
+select_desktop_package() {
+    local choice
+    local -a desktop_packages=(
+        "ubuntu-desktop-minimal"
+        "ubuntu-desktop"
+        "xubuntu-desktop-minimal"
+        "xubuntu-desktop"
+        "lubuntu-desktop"
+        "kubuntu-desktop"
+        "ubuntucinnamon-desktop-minimal"
+        "ubuntucinnamon-desktop"
+        "ubuntu-budgie-desktop-minimal"
+        "ubuntu-budgie-desktop"
+    )
+
+    echo "Select desktop package:"
+    PS3="Enter choice [1-$(( ${#desktop_packages[@]} + 2 ))]: "
+    select choice in "${desktop_packages[@]}" "None" "Custom"
+    do
+        case "$choice" in
+            "None")
+                DESKTOP_PACKAGE=""
+                return 0
+                ;;
+            "Custom")
+                read -r -p "Enter custom desktop package (leave empty for none): " DESKTOP_PACKAGE
+                return 0
+                ;;
+            "")
+                ;;
+            *)
+                DESKTOP_PACKAGE="$choice"
+                return 0
+                ;;
+        esac
+        echo "Invalid choice, please try again."
+    done
+}
+
+is_crosh_shell() {
+    if [ -n "${CROS_USER_ID_HASH:-}" ]; then
+        return 0
+    fi
+
+    local pid ppid comm cmdline
+
+    pid="$$"
+    while [ "$pid" != "1" ] && [ -r "/proc/$pid/stat" ]; do
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+
+        case "$comm $cmdline" in
+            *crosh*|*crosh.sh*|*crosh_builtin*|*secure_shell*)
+                return 0
+                ;;
+        esac
+
+        ppid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
+        [ -n "$ppid" ] || break
+        pid="$ppid"
+    done
+
+    return 1
+}
+
+reject_crosh_shell() {
+    if is_crosh_shell; then
+        die "Please do not run this script from crosh. Run this script from ChromeOS VT2, not from crosh: press Ctrl+Alt+F2(Refresh/Forward), login as root, then run this script."
+    fi
+}
+
+stop_chromeos_ui() {
+    echo "Stopping ChromeOS UI/session_manager..."
+    if command -v stop >/dev/null 2>&1; then
+        stop ui 2>/dev/null || true
+    elif command -v initctl >/dev/null 2>&1; then
+        initctl stop ui 2>/dev/null || true
+    else
+        echo "WARNING: neither stop nor initctl found; cannot stop ChromeOS UI."
+        return 0
+    fi
+    initctl stop system-services 2>/dev/null || true
+    initctl stop powerd 2>/dev/null || true
+    sleep 1
+
+    echo 1 | tee /proc/sys/kernel/sysrq
+    echo u | tee /proc/sysrq-trigger   # remount readonly
+}
+
+write_fstab() {
+    cat > "$ROOTFS_MNT/etc/fstab" <<EOF
+UUID=$ROOTFS_UUID / ext4 defaults 0 1
+UUID=$EFI_UUID /boot/efi vfat umask=0077 0 1
+EOF
+}
+
+prepare_staging_rootfs() {
+    rm -rf "$ROOTFS_MNT"
+    mkdir -p "$ROOTFS_MNT"
+
+    echo "Mapping tail ${STAGING_SIZE_MIB}MiB of p3 as staging loop..."
+    LOOP_STAGE="$(
+        losetup --find --show \
+            --offset "$STAGING_OFFSET_BYTES" \
+            --sizelimit "$STAGING_SIZE_BYTES" \
+            "$DISK"
+    )"
+
+    echo "Formatting staging loop as ext4 via $LOOP_STAGE..."
+    mkfs.ext4 -F -L staging-rootfs "$LOOP_STAGE"
+
+    echo "Mounting staging ext4 on $ROOTFS_MNT..."
+    mount "$LOOP_STAGE" "$ROOTFS_MNT"
+}
+
+prepare_chroot_mounts() {
+    mkdir -p \
+        "$ROOTFS_MNT/dev" \
+        "$ROOTFS_MNT/dev/pts" \
+        "$ROOTFS_MNT/proc" \
+        "$ROOTFS_MNT/sys" \
+        "$ROOTFS_MNT/run" \
+        "$ROOTFS_MNT/etc" \
+        "$ROOTFS_MNT/boot/efi"
+
+    mount --bind /dev "$ROOTFS_MNT/dev"
+    mount --bind /dev/pts "$ROOTFS_MNT/dev/pts"
+    mount --bind /proc "$ROOTFS_MNT/proc"
+    mount --bind /sys "$ROOTFS_MNT/sys"
+    mount --bind /run "$ROOTFS_MNT/run"
+
+    rm -f "$ROOTFS_MNT/etc/resolv.conf"
+    touch "$ROOTFS_MNT/etc/resolv.conf"
+    mount --bind /etc/resolv.conf "$ROOTFS_MNT/etc/resolv.conf"
+
+    mount "$LOOP_P2" "$ROOTFS_MNT/boot/efi"
+}
+
+cleanup_chroot_mounts() {
+    local mount_path
+
+    for mount_path in \
+        "$ROOTFS_MNT/boot/efi" \
+        "$ROOTFS_MNT/etc/resolv.conf" \
+        "$ROOTFS_MNT/run" \
+        "$ROOTFS_MNT/sys" \
+        "$ROOTFS_MNT/proc" \
+        "$ROOTFS_MNT/dev/pts" \
+        "$ROOTFS_MNT/dev"
+    do
+        if mountpoint -q "$mount_path"; then
+            umount "$mount_path"
+        fi
+    done
+}
+
+copy_rootfs_to_target() {
+    local staging_bytes
+
+    staging_bytes="$(blockdev --getsize64 "$LOOP_STAGE")"
+    [[ -n "$staging_bytes" ]] || die "failed to get staging image size"
+    [[ "$staging_bytes" =~ ^[0-9]+$ ]] || die "invalid staging image size: $staging_bytes"
+
+    if (( staging_bytes > P3_SIZE_BYTES )); then
+        die "staging image is larger than p3 rootfs partition"
+    fi
+
+    sync
+    if mountpoint -q "$ROOTFS_MNT"; then
+        umount "$ROOTFS_MNT"
+    fi
+    echo "-----------------------------------------------------------------------"
+    echo "Default username: $INSTALL_USER, password: $INSTALL_PASSWORD"
+    if [[ "$DISTRO" == "omarchy" ]]; then
+        echo "First boot is a TTY Arch system (Submarine + GRUB)."
+        echo "After login and network is up, run:"
+        echo "  curl -fsSL https://omarchy.org/install | bash"
+        echo "When Omarchy asks about Limine/btrfs, choose Proceed anyway."
+        echo "Those features need UEFI; Chromebooks boot via Submarine."
+    else
+        echo "Snap packages are not installed by default so web browser may not be installed."
+        echo "You can do [snap install firefox] after first login."
+    fi
+    echo
+    echo "Writing staging ext4 loop into p3 via $LOOP_P3..."
+    echo "After below progress completed, press [Refresh + Power] to reboot immediately!"
+    echo "-----------------------------------------------------------------------"
+    dd if="$LOOP_STAGE" of="$LOOP_P3" bs=128M status=progress conv=fsync
+}
+
+configure_rootfs() {
+    mkdir -p "$ROOTFS_MNT/etc/apt"
+
+    write_fstab
+
+    cat > "$ROOTFS_MNT/usr/bin/firstboot-expand-rootfs" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+root_source="$(findmnt -n -o SOURCE /)"
+[[ -n "$root_source" ]] || exit 1
+
+rm -f /etc/resolv.conf
+
+resize2fs "$root_source"
+apt clean
+apt autoclean
+fstrim -av
+sed -i '\|/usr/bin/firstboot-expand-rootfs|d' /etc/rc.local
+rm -f /usr/bin/firstboot-expand-rootfs
+EOF
+    chmod 0755 "$ROOTFS_MNT/usr/bin/firstboot-expand-rootfs"
+
+    cat > "$ROOTFS_MNT/etc/rc.local" <<'EOF'
+#!/bin/bash
+set -e
+
+/usr/bin/firstboot-expand-rootfs || true
+exit 0
+EOF
+    chmod 0755 "$ROOTFS_MNT/etc/rc.local"
+
+    DESKTOP_PACKAGE="$DESKTOP_PACKAGE" device_name="$device_name" chroot "$ROOTFS_MNT" /bin/bash -eux <<'EOF'
+export DEBIAN_FRONTEND=noninteractive
+
+source /etc/os-release
+
+apt-get update
+apt-get install -y \
+    "linux-generic-hwe-${VERSION_ID}" \
+    grub-efi-amd64 \
+    shim-signed \
+    sudo \
+    network-manager \
+    e2fsprogs \
+    bash-completion \
+    command-not-found \
+    systemd-sysv ${DESKTOP_PACKAGE:-}
+
+if ! id -u ubuntu >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -G sudo ubuntu
+fi
+echo 'ubuntu:ubuntu' | chpasswd
+
+printf '%s\n' "$device_name" > /etc/hostname
+touch /etc/hosts
+if ! grep -q '^127\.0\.0\.1[[:space:]]' /etc/hosts; then
+    printf '127.0.0.1\tlocalhost\n' >> /etc/hosts
+fi
+sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+printf '127.0.1.1\t%s\n' "$device_name" >> /etc/hosts
+
+
+sed -i '/^GRUB_DISABLE_OS_PROBER=/d' /etc/default/grub
+echo 'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
+
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck
+update-grub
+EOF
+}
+
+ensure_zstd() {
+    if command -v zstd >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "zstd not found; trying to extract a static binary from Debian's zstd .deb..."
+    local deb="/tmp/zstd-unpack.deb"
+    local dir="/tmp/zstd-unpack.$$"
+    mkdir -p "$dir"
+    curl -fL --progress-bar \
+        "https://deb.debian.org/debian/pool/main/libz/libzstd/zstd_1.5.7+dfsg-1_amd64.deb" \
+        -o "$deb" || die "failed to download zstd .deb (needed to unpack Arch bootstrap)"
+    need_cmd ar
+    need_cmd xz
+    (
+        cd "$dir"
+        ar x "$deb"
+        tar -xJf data.tar.xz
+    )
+    [[ -x "$dir/usr/bin/zstd" ]] || die "could not extract zstd binary"
+    mkdir -p /usr/local/bin
+    cp "$dir/usr/bin/zstd" /usr/local/bin/zstd
+    chmod 0755 /usr/local/bin/zstd
+    hash -r
+    command -v zstd >/dev/null 2>&1 || die "zstd still missing after extract"
+}
+
+extract_rootfs() {
+    echo "Streaming TAR $TAR_URL"
+    echo "  and extracting it into $ROOTFS_MNT..."
+    if [[ "$DISTRO" == "omarchy" ]]; then
+        ensure_zstd
+        curl -fL --progress-bar "$TAR_URL" |
+            zstd -d |
+            tar -xp --numeric-owner --strip-components=1 -C "$ROOTFS_MNT"
+        [[ -f "$ROOTFS_MNT/etc/os-release" ]] || die "Arch bootstrap extract failed (no /etc/os-release)"
+        [[ -f "$ROOTFS_MNT/etc/arch-release" ]] || touch "$ROOTFS_MNT/etc/arch-release"
+    else
+        curl -fL --progress-bar "$TAR_URL" |
+            tar -xzp --numeric-owner -C "$ROOTFS_MNT"
+    fi
+}
+
+configure_omarchy_rootfs() {
+    write_fstab
+
+    cat > "$ROOTFS_MNT/usr/bin/firstboot-expand-rootfs" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+root_source="$(findmnt -n -o SOURCE /)"
+[[ -n "$root_source" ]] || exit 1
+
+rm -f /etc/resolv.conf
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+
+resize2fs "$root_source" || true
+pacman -Scc --noconfirm || true
+fstrim -av || true
+sed -i '\|/usr/bin/firstboot-expand-rootfs|d' /etc/rc.local
+rm -f /usr/bin/firstboot-expand-rootfs
+EOF
+    chmod 0755 "$ROOTFS_MNT/usr/bin/firstboot-expand-rootfs"
+
+    cat > "$ROOTFS_MNT/etc/rc.local" <<'EOF'
+#!/bin/bash
+set -e
+/usr/bin/firstboot-expand-rootfs || true
+exit 0
+EOF
+    chmod 0755 "$ROOTFS_MNT/etc/rc.local"
+
+    mkdir -p "$ROOTFS_MNT/etc/pacman.d"
+    cat > "$ROOTFS_MNT/etc/pacman.d/mirrorlist" <<'EOF'
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+Server = https://mirror.rackspace.com/archlinux/$repo/os/$arch
+EOF
+
+    cat > "$ROOTFS_MNT/etc/motd" <<'EOF'
+
+This is Arch on Chromebook (cromarchy).
+Bootloader is Submarine + GRUB, not Omarchy's Limine.
+
+After network is up, install Omarchy as the omarchy user:
+  curl -fsSL https://omarchy.org/install | bash
+
+When the installer says you need Limine or btrfs, choose
+"Proceed anyway" — those are for UEFI PCs, not depthcharge.
+
+Audio: https://github.com/WeirdTreeThing/chromebook-linux-audio
+
+EOF
+
+    device_name="$device_name" INSTALL_USER="$INSTALL_USER" INSTALL_PASSWORD="$INSTALL_PASSWORD" \
+        chroot "$ROOTFS_MNT" /bin/bash -eux <<'EOF'
+export LANG=C
+
+pacman-key --init
+pacman-key --populate archlinux
+pacman -Syu --noconfirm
+pacman -S --noconfirm --needed \
+    base linux linux-firmware mkinitcpio \
+    grub efibootmgr \
+    sudo networkmanager \
+    git curl \
+    intel-ucode amd-ucode \
+    e2fsprogs dosfstools \
+    vim less which \
+    limine
+
+if ! id -u "$INSTALL_USER" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -G wheel "$INSTALL_USER"
+fi
+echo "$INSTALL_USER:$INSTALL_PASSWORD" | chpasswd
+mkdir -p /etc/sudoers.d
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
+echo "$INSTALL_USER ALL=(ALL) NOPASSWD: ALL" > "/etc/sudoers.d/${INSTALL_USER}-nopasswd"
+chmod 0440 /etc/sudoers.d/wheel "/etc/sudoers.d/${INSTALL_USER}-nopasswd"
+
+printf '%s\n' "$device_name" > /etc/hostname
+touch /etc/hosts
+if ! grep -q '^127\.0\.0\.1[[:space:]]' /etc/hosts; then
+    printf '127.0.0.1\tlocalhost\n' >> /etc/hosts
+fi
+sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+printf '127.0.1.1\t%s\n' "$device_name" >> /etc/hosts
+
+sed -i '/^GRUB_DISABLE_OS_PROBER=/d' /etc/default/grub
+echo 'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
+mkdir -p /boot/efi
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch --recheck
+grub-mkconfig -o /boot/grub/grub.cfg
+
+mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/sysinit.target.wants
+ln -sf /usr/lib/systemd/system/NetworkManager.service /etc/systemd/system/multi-user.target.wants/NetworkManager.service || \
+    systemctl enable NetworkManager.service
+ln -sf /usr/lib/systemd/system/systemd-timesyncd.service /etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service || true
+EOF
+}
+
+
+reject_crosh_shell
+
+[[ "$(id -u)" == "0" ]] || die "run as root"
+
+need_cmd curl
+need_cmd bsdunzip
+need_cmd dd
+need_cmd cgpt
+need_cmd blockdev
+need_cmd fdisk
+need_cmd awk
+need_cmd sed
+need_cmd grep
+need_cmd losetup
+need_cmd mkfs.vfat
+need_cmd mkfs.ext4
+need_cmd mount
+need_cmd umount
+need_cmd mountpoint
+need_cmd tar
+need_cmd chroot
+need_cmd blkid
+need_cmd cros_config
+
+cd /tmp
+device_name="$(cros_config / name)"
+[[ -n "$device_name" ]] || die "cros_config returned an empty device name"
+
+select_distro
+if [[ "$DISTRO" == "ubuntu" ]]; then
+    select_tar_url
+    select_desktop_package
+fi
+DISK="$(find_target_disk)"
+[[ -b "$DISK" ]] || die "target disk is not a block device: $DISK"
+
+DISK_BASE="$(basename "$DISK")"
+REMOVABLE_FILE="/sys/class/block/${DISK_BASE}/removable"
+if [[ -f "$REMOVABLE_FILE" ]]; then
+    REMOVABLE="$(cat "$REMOVABLE_FILE")"
+    [[ "$REMOVABLE" == "0" ]] || die "target disk appears removable: $DISK"
+fi
+
+DISK_BYTES="$(blockdev --getsize64 "$DISK")"
+SECTOR_SIZE="$(blockdev --getss "$DISK")"
+TOTAL_SECTORS="$(blockdev --getsz "$DISK")"
+STAGING_SIZE_BYTES=$(( STAGING_SIZE_MIB * 1024 * 1024 ))
+MIN_DISK_MIB=$(( STAGING_SIZE_MIB * 2 + 1024 ))
+MIN_DISK_BYTES=$(( MIN_DISK_MIB * 1024 * 1024 ))
+
+if (( DISK_BYTES <= MIN_DISK_BYTES )); then
+    die "target disk must be larger than ${MIN_DISK_MIB}MiB (2x ${STAGING_SIZE_MIB}MiB staging + 1GiB overhead for EFI/MINIOS-B)"
+fi
+
+detect_minios_partition
+
+echo "Internal disk: $DISK"
+echo "Device name:   $device_name"
+echo "Distro:      $DISTRO"
+echo "TarBall URL:     $TAR_URL"
+if [[ "$DISTRO" == "ubuntu" ]]; then
+    echo "Desktop pkg: ${DESKTOP_PACKAGE:-<none>}"
+fi
+echo "Login:       $INSTALL_USER / $INSTALL_PASSWORD"
+echo "Disk size:   $DISK_BYTES bytes"
+echo "Sector size: $SECTOR_SIZE bytes"
+echo "Sectors:     $TOTAL_SECTORS"
+if [[ -n "$MINIOS_START" ]]; then
+    echo "MINIOS-B:    start=$MINIOS_START size=$MINIOS_SIZE type-uuid=$MINIOS_TYPE_UUID"
+fi
+
+echo
+echo "WARNING: ALL DATA WILL BE ERASED ON THIS DISK!"
+read -r -p "CONTINUE? [y/N] " CONFIRM
+
+case "$CONFIRM" in
+    [Yy]|[Yy][Ee][Ss])
+        echo "Continuing..."
+        ;;
+    ""|[Nn]|[Nn][Oo])
+        die "Aborted by user."
+        ;;
+    *)
+        die "Invalid answer: $CONFIRM"
+        ;;
+esac
+echo
+
+echo
+echo "DANGER: this will overwrite $DISK completely."
+echo "Sleeping 5 seconds. Now you still have chance to cancel. Press Ctrl+C to abort."
+sleep 5
+
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+echo "Downloading Submarine..."
+curl -fL --progress-bar "$SUBMARINE_ZIP_URL" -o submarine-x86_64.zip
+
+echo "Unzipping Submarine..."
+bsdunzip -q submarine-x86_64.zip
+
+[[ -f submarine-x86.bin ]] || die "submarine-x86.bin not found in zip root"
+
+stop_chromeos_ui
+
+echo "Writing submarine-x86.bin to $DISK..."
+dd if=submarine-x86.bin of="$DISK" bs=4M status=progress conv=fsync
+
+sync
+
+echo "Repairing GPT to target disk size..."
+cgpt repair "$DISK"
+
+echo "Reading p1 layout from GPT..."
+P1_START="$(cgpt show "$DISK" | awk '$3 == "1" {print $1; exit}')"
+P1_SIZE="$(cgpt show "$DISK" | awk '$3 == "1" {print $2; exit}')"
+
+[[ -n "$P1_START" && -n "$P1_SIZE" ]] || die "could not parse p1 from cgpt show"
+[[ "$P1_START" =~ ^[0-9]+$ ]] || die "invalid P1_START: $P1_START"
+[[ "$P1_SIZE" =~ ^[0-9]+$ ]] || die "invalid P1_SIZE: $P1_SIZE"
+
+P1_END=$(( P1_START + P1_SIZE ))
+
+EFI_SIZE_SECTORS=$(( EFI_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE ))
+
+P2_START="$(align_up "$P1_END" "$ALIGN_SECTORS")"
+P2_SIZE="$(align_up "$EFI_SIZE_SECTORS" "$ALIGN_SECTORS")"
+P2_END=$(( P2_START + P2_SIZE ))
+
+P3_START="$(align_up "$P2_END" "$ALIGN_SECTORS")"
+
+if [[ -n "$MINIOS_START" ]]; then
+    P3_END="$(align_down "$MINIOS_START" "$ALIGN_SECTORS")"
+else
+    P3_END="$(align_down "$(( TOTAL_SECTORS - ALIGN_SECTORS ))" "$ALIGN_SECTORS")"
+fi
+
+P3_SIZE=$(( P3_END - P3_START ))
+
+if (( P3_SIZE <= 0 )); then
+    die "not enough room for p2=${EFI_SIZE_MIB}MiB and p3=rootfs"
+fi
+
+P2_OFFSET_BYTES=$(( P2_START * SECTOR_SIZE ))
+P2_SIZE_BYTES=$(( P2_SIZE * SECTOR_SIZE ))
+
+P3_OFFSET_BYTES=$(( P3_START * SECTOR_SIZE ))
+P3_SIZE_BYTES=$(( P3_SIZE * SECTOR_SIZE ))
+
+# Place staging loop at the end of p3 partition
+STAGING_OFFSET_BYTES=$(( P3_OFFSET_BYTES + P3_SIZE_BYTES - STAGING_SIZE_BYTES ))
+P3_WRITE_END_BYTES=$(( P3_OFFSET_BYTES + STAGING_SIZE_BYTES ))
+
+if (( STAGING_SIZE_BYTES > P3_SIZE_BYTES )); then
+    die "staging loop is larger than p3 rootfs partition"
+fi
+
+if (( P3_WRITE_END_BYTES > STAGING_OFFSET_BYTES )); then
+    die "staging loop would overlap the p3 destination write range (p3 must be >= 2x staging size)"
+fi
+
+if (( STAGING_OFFSET_BYTES % SECTOR_SIZE != 0 )); then
+    die "staging loop offset is not sector aligned"
+fi
+
+echo "Partition plan:"
+echo "  p1 Submarine: start=$P1_START size=$P1_SIZE"
+echo "  p2 EFI:       start=$P2_START size=$P2_SIZE"
+echo "  p3 rootfs:    start=$P3_START size=$P3_SIZE"
+if [[ -n "$MINIOS_START" ]]; then
+    echo "  p4 MINIOS-B:  start=$MINIOS_START size=$MINIOS_SIZE"
+fi
+
+echo "Byte ranges:"
+echo "  p2 EFI:       offset=$P2_OFFSET_BYTES size=$P2_SIZE_BYTES"
+echo "  p3 rootfs:    offset=$P3_OFFSET_BYTES size=$P3_SIZE_BYTES"
+echo "  p3 write:     offset=$P3_OFFSET_BYTES size=$STAGING_SIZE_BYTES"
+echo "  staging loop: offset=$STAGING_OFFSET_BYTES size=$STAGING_SIZE_BYTES"
+
+echo "Creating p2 EFI partition in GPT..."
+cgpt add -i 2 -b "$P2_START" -s "$P2_SIZE" -t efi -l "EFI-SYSTEM" "$DISK"
+
+echo "Creating p3 rootfs partition in GPT..."
+cgpt add -i 3 -b "$P3_START" -s "$P3_SIZE" -t data -l "ROOTFS" "$DISK"
+
+if [[ -n "$MINIOS_START" ]]; then
+    echo "Recreating p4 MINIOS-B partition in GPT..."
+    cgpt add -i 4 -b "$MINIOS_START" -s "$MINIOS_SIZE" -t "$MINIOS_TYPE_UUID" -l "MINIOS-B" "$DISK"
+fi
+
+sync
+
+echo "Mapping p2 EFI byte range as loop device..."
+LOOP_P2="$(
+    losetup --find --show \
+        --offset "$P2_OFFSET_BYTES" \
+        --sizelimit "$P2_SIZE_BYTES" \
+        "$DISK"
+)"
+
+echo "Formatting p2 EFI range as FAT32 via $LOOP_P2..."
+mkfs.vfat -F 32 -n EFI "$LOOP_P2"
+
+echo "Keeping EFI loop device $LOOP_P2 for later chroot use..."
+
+echo "Mapping p3 rootfs byte range as loop device..."
+LOOP_P3="$(
+    losetup --find --show \
+        --offset "$P3_OFFSET_BYTES" \
+        --sizelimit "$P3_SIZE_BYTES" \
+        "$DISK"
+)"
+
+prepare_staging_rootfs
+mkdir -p "$ROOTFS_MNT/boot/efi"
+
+extract_rootfs
+
+ROOTFS_UUID="$(blkid -s UUID -o value "$LOOP_STAGE")"
+EFI_UUID="$(blkid -s UUID -o value "$LOOP_P2")"
+
+[[ -n "$ROOTFS_UUID" ]] || die "failed to get rootfs UUID"
+[[ -n "$EFI_UUID" ]] || die "failed to get EFI UUID"
+
+prepare_chroot_mounts
+if [[ "$DISTRO" == "omarchy" ]]; then
+    configure_omarchy_rootfs
+else
+    configure_rootfs
+fi
+cleanup_chroot_mounts
+
+initctl stop boot-services 2>/dev/null || true
+
+copy_rootfs_to_target
