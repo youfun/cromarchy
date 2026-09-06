@@ -12,7 +12,7 @@ SUBMARINE_ZIP_URL="https://github.com/youfun/cromarchy/raw/main/submarine-x86_64
 # sha256 of submarine-x86_64.zip, built by .github/workflows/build-submarine.yml
 # from a pinned FyraLabs/submarine commit. Update this hash in the same commit
 # as the zip. The script refuses to unpack on mismatch.
-SUBMARINE_ZIP_SHA256="4f995057277eab5665f76e24a700bc13b838dee29690419957d5141f7471b3e6"
+SUBMARINE_ZIP_SHA256="5699450668af47e3bca80b34c3ae5a9fc438a248d357e353c3821bef0c3d1ca5"
 ARCH_BOOTSTRAP_URL="https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
 WORKDIR="/tmp/submarine-install.$$"
 ROOTFS_MNT="/tmp/rootfs"
