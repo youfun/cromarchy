@@ -9,6 +9,10 @@ set -euo pipefail
 # the official Omarchy installer on first boot (Proceed anyway on Limine/btrfs).
 
 SUBMARINE_ZIP_URL="https://github.com/youfun/cromarchy/raw/main/submarine-x86_64.zip"
+# sha256 of submarine-x86_64.zip, built by .github/workflows/build-submarine.yml
+# from a pinned FyraLabs/submarine commit. Update this hash in the same commit
+# as the zip. The script refuses to unpack on mismatch.
+SUBMARINE_ZIP_SHA256="5699450668af47e3bca80b34c3ae5a9fc438a248d357e353c3821bef0c3d1ca5"
 ARCH_BOOTSTRAP_URL="https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst"
 WORKDIR="/tmp/submarine-install.$$"
 ROOTFS_MNT="/tmp/rootfs"
@@ -569,6 +573,7 @@ reject_crosh_shell
 
 need_cmd curl
 need_cmd bsdunzip
+need_cmd sha256sum
 need_cmd dd
 need_cmd cgpt
 need_cmd blockdev
@@ -662,6 +667,10 @@ cd "$WORKDIR"
 
 echo "Downloading Submarine..."
 curl -fL --progress-bar "$SUBMARINE_ZIP_URL" -o submarine-x86_64.zip
+got="$(sha256sum submarine-x86_64.zip | awk '{print $1}')"
+if [[ "$got" != "$SUBMARINE_ZIP_SHA256" ]]; then
+    die "submarine-x86_64.zip sha256 mismatch (got $got, expected $SUBMARINE_ZIP_SHA256)"
+fi
 
 echo "Unzipping Submarine..."
 bsdunzip -q submarine-x86_64.zip
