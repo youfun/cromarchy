@@ -142,7 +142,10 @@ jobs:
 
           extract="$(mktemp -d)"
           cpio_path="$(pwd)/u-root-x86.cpio"
-          ( cd "${extract}" && cpio -id --quiet < "${cpio_path}" )
+          # Extract only the flags file. Full cpio -id tries to mknod /dev/*
+          # which GitHub-hosted runners do not allow.
+          ( cd "${extract}" && cpio -id --quiet --no-absolute-filenames \
+              'etc/uinit.flags' < "${cpio_path}" )
           flags="${extract}/etc/uinit.flags"
           test -f "${flags}"
           echo "uinit.flags (repr): $(cat -A "${flags}")"
