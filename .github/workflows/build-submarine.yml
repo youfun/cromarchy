@@ -13,6 +13,9 @@ on:
         required: false
         type: string
         default: ""
+  # Same-repo PRs need a run so the zip/hash pin can land in the same PR.
+  # After merge, workflow_dispatch is the supported trigger.
+  pull_request:
 
 permissions:
   contents: write
@@ -198,6 +201,7 @@ jobs:
           if-no-files-found: error
 
       - name: Write release notes
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           cat > dist/RELEASE.md <<EOF
@@ -219,6 +223,7 @@ jobs:
 
       # softprops/action-gh-release@v2.5.3
       - name: Publish GitHub Release
+        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@1853d73993c8ca1b2c9c1a7fede39682d0ab5c2a
         with:
           tag_name: ${{ env.RELEASE_TAG }}
